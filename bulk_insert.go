@@ -10,6 +10,23 @@ import (
 	"github.com/jinzhu/gorm"
 )
 
+// Insert multiple records at once.  Perform update if record already exists.
+// [objects]        Must be a slice of struct
+// [key]            Table key used to detect duplicate rows.
+// [chunkSize]      Number of records to insert at once.
+//                  Embedding a large number of variables at once will raise an error beyond the limit of prepared statement.
+//                  Larger size will normally lead the better performance, but 2000 to 3000 is reasonable.
+// [excludeColumns] Columns you want to exclude from insert. You can omit if there is no column you want to exclude.
+func BulkInsertWithUpdate(db *gorm.DB, objects []interface{}, chunkSize int, excludeColumns ...string) error {
+	// Split records with specified size not to exceed Database parameter limit
+	for _, objSet := range splitObjects(objects, chunkSize) {
+		if err := insertObjSet(db, objSet, true, excludeColumns...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Insert multiple records at once
 // [objects]        Must be a slice of struct
 // [chunkSize]      Number of records to insert at once.
@@ -19,14 +36,14 @@ import (
 func BulkInsert(db *gorm.DB, objects []interface{}, chunkSize int, excludeColumns ...string) error {
 	// Split records with specified size not to exceed Database parameter limit
 	for _, objSet := range splitObjects(objects, chunkSize) {
-		if err := insertObjSet(db, objSet, excludeColumns...); err != nil {
+		if err := insertObjSet(db, objSet, false, excludeColumns...); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) error {
+func insertObjSet(db *gorm.DB, objects []interface{}, doUpdate bool, excludeColumns ...string) error {
 	if len(objects) == 0 {
 		return nil
 	}
@@ -35,6 +52,10 @@ func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) 
 	if err != nil {
 		return err
 	}
+
+	keyStatus := extractKeyStatus(objects[0], excludeColumns)
+	var keys []string
+	var updates []string
 
 	attrSize := len(firstAttrs)
 
@@ -45,8 +66,15 @@ func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) 
 
 	// Replace with database column name
 	dbColumns := make([]string, 0, attrSize)
+	//var nonKeyColumns []string
 	for _, key := range sortedKeys(firstAttrs) {
 		dbColumns = append(dbColumns, mainScope.Quote(gorm.ToColumnName(key)))
+		isKey, ok := keyStatus[key]
+		if isKey {
+			keys = append(keys, key)
+		} else if ok && !isKey {
+			updates = append(updates, fmt.Sprintf("%s = excluded.%s", key, key))
+		}
 	}
 
 	for _, obj := range objects {
@@ -76,13 +104,38 @@ func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) 
 		mainScope.SQLVars = append(mainScope.SQLVars, scope.SQLVars...)
 	}
 
-	mainScope.Raw(fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-		mainScope.QuotedTableName(),
-		strings.Join(dbColumns, ", "),
-		strings.Join(placeholders, ", "),
-	))
+	if !doUpdate || len(keys) == 0 {
+		mainScope.Raw(fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+			mainScope.QuotedTableName(),
+			strings.Join(dbColumns, ", "),
+			strings.Join(placeholders, ", "),
+		))
+	} else {
+		sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s ON CONFLICT (%s) DO UPDATE SET %s",
+			mainScope.QuotedTableName(),
+			strings.Join(dbColumns, ", "),
+			strings.Join(placeholders, ", "),
+			strings.Join(keys, ", "),
+			strings.Join(updates, ", "),
+		)
+		//fmt.Printf("sql: %s\n", sql)
+		mainScope.Raw(sql)
+	}
 
 	return db.Exec(mainScope.SQL, mainScope.SQLVars...).Error
+}
+
+func extractKeyStatus(value interface{}, excludeColumns []string) map[string]bool {
+	primaryKeyMap := map[string]bool{}
+	for _, field := range (&gorm.Scope{Value: value}).Fields() {
+		// Exclude relational record because it's not directly contained in database columns
+		_, hasForeignKey := field.TagSettingsGet("FOREIGNKEY")
+		if !containString(excludeColumns, field.Struct.Name) && field.StructField.Relationship == nil && !hasForeignKey &&
+			!field.IsIgnored && !(field.DBName == "id" && fieldIsAutoIncrement(field)) {
+			primaryKeyMap[field.DBName] = field.IsPrimaryKey
+		}
+	}
+	return primaryKeyMap
 }
 
 // Obtain columns and values required for insert from interface
